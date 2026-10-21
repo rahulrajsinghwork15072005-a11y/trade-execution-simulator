@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trade Execution Simulator</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root { --bg:#0a0f0d; --panel:#121a17; --ink:#e6edf3; --muted:#8b98a5; --accent:#2ec4b6; --pos:#3fb950; --neg:#f85149; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,Segoe UI,Roboto,sans-serif; }
+    header { padding:16px 24px; border-bottom:1px solid #1d2926; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }
+    h1 { margin:0; font-size:20px; } .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+    select { background:#0d1117; color:var(--ink); border:1px solid #30363d; border-radius:6px; padding:6px 10px; font-size:13px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px 24px; }
+    .card { background:var(--panel); border:1px solid #1d2926; border-radius:10px; padding:14px; } .full { grid-column:1/-1; }
+    .card h2 { font-size:14px; margin:0 0 10px; color:var(--accent); font-weight:600; }
+    .plot { width:100%; height:300px; } table { width:100%; border-collapse:collapse; font-size:12.5px; }
+    th,td { text-align:right; padding:6px 8px; border-bottom:1px solid #1d2926; } th:first-child,td:first-child{ text-align:left; } th{ color:var(--muted); font-weight:500; }
+    .pos{ color:var(--pos);} .neg{ color:var(--neg);}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Trade Execution Simulator</h1>
+      <div class="sub">TWAP / VWAP / POV / Almgren&ndash;Chriss with impact, slippage, and implementation-shortfall TCA.</div>
+    </div>
+    <div><label class="sub">strategy&nbsp;</label><select id="strategy" onchange="loadStrategy()"></select></div>
+  </header>
+
+  <div class="grid">
+    <div class="card full"><h2>Execution schedule (shares per interval) &amp; volume curve</h2><div id="schedPlot" class="plot"></div></div>
+    <div class="card"><h2>Fills over the price path</h2><div id="fillPlot" class="plot"></div></div>
+    <div class="card"><h2>Implementation-shortfall decomposition (bps)</h2><div id="waterfallPlot" class="plot"></div></div>
+    <div class="card"><h2>Almgren&ndash;Chriss efficient frontier</h2><div id="frontierPlot" class="plot"></div></div>
+    <div class="card"><h2>Monte-Carlo cost distribution (bps)</h2><div id="mcPlot" class="plot"></div></div>
+    <div class="card full"><h2>Strategy comparison (TCA)</h2>
+      <table id="cmpTable"><thead><tr><th>Strategy</th><th>Avg price</th><th>IS (bps)</th><th>VWAP slip (bps)</th><th>Arrival slip (bps)</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+<script>
+const LAYOUT={paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#e6edf3',size:11},margin:{l:52,r:48,t:10,b:36},xaxis:{gridcolor:'#1d2926'},yaxis:{gridcolor:'#1d2926'},showlegend:true,legend:{orientation:'h'}};
+const CFG={displayModeBar:false,responsive:true};
+const api=p=>fetch(p).then(r=>r.json());
+const COLORS={TWAP:'#4da3ff',VWAP:'#2ec4b6',POV:'#a371f7',AlmgrenChriss:'#f0a500'};
+
+async function init(){
+  const s=await api('/api/strategies');
+  document.getElementById('strategy').innerHTML=s.strategies.map(x=>`<option ${x==='VWAP'?'selected':''}>${x}</option>`).join('');
+  await Promise.all([loadSchedule(), loadFrontier(), loadCompare(), loadStrategy()]);
+}
+
+async function loadSchedule(){
+  const d=await api('/api/demo/schedule');
+  const traces=Object.entries(d.strategies).map(([name,xs])=>({x:d.intervals,y:xs,name,type:'scatter',line:{color:COLORS[name]||'#888'}}));
+  traces.push({x:d.intervals,y:d.volume,name:'mkt volume',type:'bar',yaxis:'y2',marker:{color:'rgba(139,152,165,.25)'}});
+  const lay=Object.assign({},LAYOUT,{yaxis:{title:'shares',gridcolor:'#1d2926'},yaxis2:{overlaying:'y',side:'right',showgrid:false,title:'volume'}});
+  Plotly.newPlot('schedPlot',traces,lay,CFG);
+}
+
+async function loadStrategy(){
+  const name=document.getElementById('strategy').value||'VWAP';
+  const [r, mc]=await Promise.all([api('/api/demo/simulate?strategy='+name), api('/api/demo/montecarlo?strategy='+name+'&n_paths=400')]);
+  const n=r.base_prices.length, x=[...Array(n).keys()];
+  const base={x,y:r.base_prices,name:'mid',type:'scatter',line:{color:'#8b98a5'}};
+  const fills={x,y:r.exec_prices,name:'fills',mode:'markers',type:'scatter',marker:{color:'#2ec4b6',size:6}};
+  const arr={x,y:x.map(()=>r.benchmarks.arrival),name:'arrival',type:'scatter',line:{color:'#f85149',dash:'dash'}};
+  Plotly.newPlot('fillPlot',[base,fills,arr],LAYOUT,CFG);
+
+  const t=r.tca;
+  const labels=['spread','temporary','permanent','timing','TOTAL IS'];
+  const vals=[t.spread_cost_bps,t.temporary_impact_bps,t.permanent_impact_bps,t.timing_bps,t.implementation_shortfall_bps];
+  Plotly.newPlot('waterfallPlot',[{x:labels,y:vals,type:'bar',marker:{color:['#4da3ff','#2ec4b6','#a371f7','#8b98a5','#f0a500']}}],
+    Object.assign({},LAYOUT,{showlegend:false,yaxis:{title:'bps',gridcolor:'#1d2926'}}),CFG);
+
+  Plotly.newPlot('mcPlot',[{x:mc.samples,type:'histogram',marker:{color:'#2ec4b6'},nbinsx:40}],
+    Object.assign({},LAYOUT,{showlegend:false,xaxis:{title:`bps (mean ${mc.mean.toFixed(2)}, p5 ${mc.p5.toFixed(2)}, p95 ${mc.p95.toFixed(2)})`,gridcolor:'#1d2926'}}),CFG);
+}
+
+async function loadFrontier(){
+  const d=await api('/api/demo/frontier');
+  const xs=d.points.map(p=>p.std), ys=d.points.map(p=>p.expected_cost);
+  Plotly.newPlot('frontierPlot',[{x:xs,y:ys,mode:'lines+markers',type:'scatter',line:{color:'#f0a500'},
+    text:d.points.map(p=>'λ='+p.risk_aversion.toExponential(1)),hoverinfo:'text+x+y'}],
+    Object.assign({},LAYOUT,{showlegend:false,xaxis:{title:'risk (std of cost)',gridcolor:'#1d2926'},yaxis:{title:'expected cost',gridcolor:'#1d2926'}}),CFG);
+}
+
+async function loadCompare(){
+  const d=await api('/api/demo/compare');
+  document.querySelector('#cmpTable tbody').innerHTML=d.rows.map(r=>
+    `<tr><td>${r.strategy}</td><td>${r.avg_price.toFixed(4)}</td><td>${r.is_bps.toFixed(2)}</td><td>${r.vwap_slippage_bps.toFixed(2)}</td><td>${r.arrival_slippage_bps.toFixed(2)}</td></tr>`).join('');
+}
+init();
+</script>
+</body>
+</html>
